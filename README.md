@@ -31,7 +31,7 @@ more useful layers on top.
 ```
 Kinesis (MyStream, LocalStack)
    │
-   ├──► dead-letter      records that aren't valid JSON objects
+   ├──► Data Incoming Issues      records that aren't valid JSON objects
    ▼
 Bronze                   raw articles + where each one came from
    ▼
@@ -64,7 +64,7 @@ up again. I learned that one the hard way (more in
 
 ### Why Spark and not Flink
 
-The brief talks about a continuous stream, but it also says the model is
+The assessment say a continuous stream, but it also says the model is
 "trained on a regular schedule". Nothing needs results within seconds, so I
 treated it as a micro-batch job: each run drains whatever's arrived since the
 last checkpoint.
@@ -105,9 +105,7 @@ export PYSPARK_DRIVER_PYTHON="$PWD/.venv/bin/python"
 .venv/bin/python -m src.pipeline
 ```
 
-Don't skip those two exports. Without them Spark's workers can pick up a
-different Python on your machine (Homebrew's 3.14, in my case) and the job
-dies at the first UDF with `PYTHON_VERSION_MISMATCH`. A good run ends with
+A good run ends with
 `PIPELINE COMPLETED SUCCESSFULLY`.
 
 Then check everything with the validator:
@@ -116,8 +114,7 @@ Then check everything with the validator:
 .venv/bin/python -m src.validate_pipeline
 ```
 
-It's read-only, runs 24 checks across every layer, and exits with `1` if
-anything's off, so you could use it to gate a training job.
+It's read-only, runs 24 checks across every layer.
 
 A few other things you can run from `processor/` (same exports):
 
@@ -130,7 +127,7 @@ A few other things you can run from `processor/` (same exports):
 .venv/bin/mlflow ui --backend-store-uri ./mlruns --port 5001
 ```
 
-I use port 5001 for MLflow because macOS AirPlay already sits on 5000.
+I use port 5001 for MLflow.
 
 The `article-processor` service in `docker-compose.yml` runs the same pipeline
 inside a container. All the results in this README came from the local
@@ -138,15 +135,14 @@ virtualenv run above, though, not the container.
 
 ## How data quality works
 
-Each record goes through a handful of simple rules. It needs an
-`article_id`, `source_id`, `title` and `body_text`, `published_at` has to be a
+It needs an `article_id`, `source_id`, `title` and `body_text`, `published_at` has to be a
 real date, and the body has to be at least 10 characters. If the same
 `article_id` shows up twice in a batch, the later copy is quarantined. Every
 rejected row records which rule it broke (`missing_title`,
 `duplicate_article_id` and so on), so you can always see why.
 
 Records that aren't even valid JSON never make it to Bronze. They go to a
-dead-letter folder with the raw bytes and the parse error, and the pipeline
+Data Incoming Issues folder with the raw bytes and the parse error, and the pipeline
 moves on. Before I added that, a bad record would just quietly disappear.
 
 Near-duplicates are articles that say almost the same thing under different
@@ -211,7 +207,7 @@ Detection happens in two stages:
 ```
 Kinesis (MyStream, LocalStack)
    │  boto3 GetRecords, per-shard checkpoint (TRIM_HORIZON / AFTER_SEQUENCE_NUMBER)
-   ├──► DEAD-LETTER   records that are not a JSON object (raw bytes kept)
+   ├──► Data Incoming Issues   records that are not a JSON object (raw bytes kept)
    ▼
 BRONZE      raw articles + ingestion lineage, append, partitioned by _ingest_date
    ▼
@@ -343,12 +339,6 @@ bucket = xxhash64(article_id) mod 100
  80-89  -> validation  (10%)
  90-99  -> test        (10%)
 ```
-
-The split is stored in a `split` column when the row is written, so an
-article stays in the same split however much data arrives later. Otherwise
-validation and test articles could drift into training between retrains, and
-you couldn't compare evaluation results. A seeded `randomSplit` can't
-guarantee this, because its assignments change whenever the input grows.
 
 ### Layout
 
@@ -695,90 +685,9 @@ other on top of being invalid. The records themselves were sorted correctly
 now ignores missing and empty IDs, there's a unit test for it, and the
 numbers above are from after the fix.
 
-#### 100k data-quality load test
 
-Last, I pushed 100,000 records with about 20% bad data through the whole
-pipeline. This ran in a completely separate stream, bucket, checkpoint and
-MLflow store (`dqtest.env`: `DQTestStream`, `dq-test-bucket`,
-`mlruns-dqtest/`), so the main dataset wasn't touched. To be safe,
-`publish_load_test.py` refuses to run against `MyStream` or `my-bucket`. The
-batch comes from a seeded random generator:
+##### 25k Data Quality load Test
 
-| Records | Count | Expected result |
-|---|---|---|
-| Valid | 80,000 | Silver, Gold, ML-ready, training layout |
-| Invalid (2,000 per rule × 6) | 12,000 | Quarantine, with a reason |
-| Exact duplicates (later copy, same `article_id`) | 5,000 | Quarantine: `duplicate_article_id` |
-| Near-duplicates (one word changed, new id, published after everything else) | 2,500 | Silver as `is_duplicate = true`, not in Gold |
-| Malformed (250 not JSON, 250 JSON string/number/array) | 500 | Dead-letter |
-
-To try it yourself (from `processor/`, with the `PYSPARK_*` exports):
-
-```bash
-set -a; source dqtest.env; set +a
-.venv/bin/python publish_load_test.py --setup && .venv/bin/python publish_load_test.py --dry-run
-```
-
-Publishing took about 7 minutes and the pipeline 2 min 43 s:
-
-| Stage | Expected | Actual |
-|---|---|---|
-| Malformed → dead-letter | 500 | **500** (250 `JSONDecodeError`; 90 string, 84 number, 76 array "not an object") |
-| Ingested into Bronze | 99,500 | **99,500** |
-| Invalid | 12,000 | **12,000**, exactly 2,000 for each of the six reasons |
-| Exact duplicates | 5,000 | **5,000** |
-| Quarantined | 17,000 | **17,000** |
-| Valid → Silver | 82,500 | **82,500** (data-quality rate 0.829) |
-| Semantic duplicates | 2,500 | **2,495**: 5 missed (see below) |
-| Gold / ML-ready / ML training | 80,000 | 80,005 (train 63,896 / validation 8,088 / test 8,021) |
-| Validator (test bucket) | 24/24 | **24/24 PASS**; Bronze 99,500 = valid 82,500 + quarantined 17,000 |
-
-All the data quality numbers were spot on. The only miss was 5 of the 2,500
-near-duplicates, so I dug into those. Each was about 95% identical to its
-original (true 3-shingle Jaccard 0.952–0.959; MinHash estimate 0.906–0.938),
-well above the 0.85 threshold. LSH just never suggested those pairs for
-comparison in the first place, which is its small built-in miss rate (0.2%
-here), not a data quality fault. Every near-duplicate that was caught pointed
-to its original, never to another copy.
-
-The fix was the two-stage check described in
-[Near-duplicates](#near-duplicates). To compare fairly, I ran the old and
-new code on the same 82,500 valid articles from this run:
-
-| Version | Near-duplicates caught | False positives | Canonical articles | Dedup time |
-|---|---|---|---|---|
-| Single LSH index at 0.85 (old) | 2,495 / 2,500 | 0 | 80,005 | 76 s |
-| Candidates at 0.70 + confirmation at 0.85 (new) | **2,500 / 2,500** | 0 | **80,000** | 76 s |
-
-The 5 real pairs are saved as a test fixture
-(`tests/fixtures/missed_near_duplicates.json`). The test built on them fails
-on the old code and passes on the new one, and a second test makes sure
-articles below 0.85 similarity still aren't merged.
-
-##### The re-run that crashed LocalStack
-
-I then tried a full re-run with the fix, again at 100k, into a second test
-stream (`dqtest2.env`). It stopped after 97,500 records. LocalStack's Kinesis
-engine (kinesis-mock) keeps every stream in one JSON state file, and at 466 MB
-(the main stream plus about 200k test records) it ran out of memory and got
-stuck restarting. That took down every stream, `MyStream` included. S3 was
-fine. Here's how I got it back without losing anything:
-
-1. Backed up all 674 S3 objects (MD5-verified) and the state file (SHA-256
-   verified) to `localstack-backup-20261012/`, outside the repository.
-2. Replaced the state file with a copy holding only `MyStream` (51.5 MB),
-   without restarting the container. LocalStack here runs without
-   persistence, so a restart would have wiped S3.
-3. Checked the result: `MyStream` was active, all 25,961 records could be
-   read from `TRIM_HORIZON`, the last sequence number matched the main
-   checkpoint, and the main validator passed 24/24 on `my-bucket`.
-
-##### The 25k re-run
-
-So I re-ran it at a quarter of the size (`publish_load_test.py --scale 0.25`)
-with the same mix of problems, in a third test environment (`dqtest3.env`:
-`DQTestStream3`, `dq-test-bucket-3`). Kinesis state stayed at about 99 MB.
-Publishing took 12 s and the pipeline 61 s, and every number matched the plan:
 
 | Stage | Expected | Actual |
 |---|---|---|
@@ -927,25 +836,6 @@ script first.
 - **An edge case with exact duplicates.** They're ranked by `published_at`,
   and the earliest copy is kept. If that copy is itself invalid, both copies
   end up in quarantine.
-- **Single shard, local mode.** LocalStack runs one shard and Spark runs in
-  `local[*]`. The code still loops over every shard and has no
-  cluster-specific settings.
-- **LocalStack's Kinesis has limited memory.** kinesis-mock keeps every
-  stream in memory and in one JSON state file. Around 200k extra records
-  (466 MB of state) used up its memory and took down every stream. LocalStack
-  here also runs without persistence, so restarting the container wipes S3.
-  Keep local test batches well below that size. LocalStack 1.2.0 starts
-  kinesis-mock as `java -XX:+UseG1GC -jar …` with no memory setting, so Java
-  defaults to about a quarter of the container's memory (about 1 GB of 3.8 GB
-  here). For bigger local tests you can:
-  - give Docker more memory;
-  - set `JAVA_TOOL_OPTIONS=-Xmx3g` on the LocalStack service (any JVM it
-    starts picks this up); or
-  - upgrade to a LocalStack version with a dedicated kinesis-mock memory
-    setting.
-
-  Turn on `PERSISTENCE=1` as well. Each of these means recreating the
-  container, so back up S3 first.
 
 ## What I'd do next
 
@@ -953,18 +843,7 @@ If this were going to production, this is what I'd change, roughly in order
 of value. The first one matters most, because it gets rid of the
 at-least-once caveat altogether.
 
-1. **A transactional table format.** Move to Delta Lake, Apache Iceberg or
-   Apache Hudi and `MERGE` on `_source_sequence_number` / `article_id`. Replays
-   become harmless and every layer ends up exactly-once.
-2. **Deduplicate Bronze.** A one-off compaction that keeps one row per
-   `_source_sequence_number`, then `MERGE` (or dedup-on-write) for new
-   batches.
-3. **Commit the checkpoint atomically.** Store it in the same transaction as
-   the ML-ready commit (in Delta table properties, say), or move to the
-   Kinesis Client Library or Spark Structured Streaming with a DynamoDB lease
-   table.
-4. **Deduplicate across batches.** Persist MinHash signatures or LSH buckets
-   so new articles are compared against history.
+1. **A transactional table format.** Move to Delta Lake, Apache Iceberg and `MERGE` on `_source_sequence_number` / `article_id`.
 5. **Orchestration.** Schedule ingest → validate → train in Airflow, Dagster
    or Step Functions, and only let training start when `validate_pipeline`
    exits with `0`.
@@ -972,19 +851,4 @@ at-least-once caveat altogether.
    and alert on the quality rate, quarantine spikes, compression-ratio drift
    and Kinesis iterator age.
 7. **Model quality.** Collect reference summaries, add ROUGE and BERTScore,
-   and compare abstractive models against the extractive baseline in MLflow.
-8. **Storage layout for training.** The partitioned layout is in place.
-   What's left: compact older partitions on a schedule, register the table in
-   a catalog (Glue or Hive), add a Petastorm or Ray Data reader for
-   multi-worker training, and retire the flat ML-ready copy once everything's
-   moved over.
-9. **A shared MLflow server.** Point MLflow at a tracking server with an S3
-   artifact store instead of local `./mlruns`.
-10. **Run it in the container by default.** Make the `article-processor`
-    compose service the main way to run it, with `PYSPARK_PYTHON` pinned in
-    the image and the validator running as a follow-up service.
-11. **Scale up deduplication.** It currently collects the valid rows onto the
-    Spark driver and runs MinHash in plain Python: 82,500 articles took about
-    76 s. At production volume it should use Spark ML's `MinHashLSH` (an
-    approximate similarity join) or a persistent LSH index shared across
-    batches.
+   and compare those models against the baseline in MLflow.
