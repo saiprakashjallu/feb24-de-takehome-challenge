@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# MLflow local tracking stores (main runs and isolated load tests)
+mlruns/
+mlruns-*/
+
+# Spark local artifacts
+spark-warehouse/
+metastore_db/
+derby.log
+
+# Editor / OS
+.DS_Store
+*.save
